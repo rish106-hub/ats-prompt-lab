@@ -128,7 +128,7 @@ All prompts live in `ats_poc/prompts.py` and are fully editable from the sidebar
 | Layer | Library |
 |-------|---------|
 | UI | [Streamlit](https://streamlit.io) |
-| LLM | [Google Gemini 1.5 Flash](https://ai.google.dev/) via `google-generativeai` |
+| LLM | [Google Gemini 2.0 Flash](https://ai.google.dev/) via `google-generativeai` |
 | PDF parsing | [pdfplumber](https://github.com/jsvine/pdfplumber) |
 | Config | [python-dotenv](https://github.com/theskumar/python-dotenv) |
 

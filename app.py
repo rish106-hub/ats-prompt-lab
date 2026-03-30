@@ -39,7 +39,7 @@ load_dotenv()
 
 st.set_page_config(page_title="ATS Prompt Lab", page_icon="📄", layout="wide")
 
-MODEL_NAME = "gemini-1.5-flash"
+MODEL_NAME = "gemini-2.0-flash"
 EVALUATION_LIMIT = 5  # Reduced from 15 to conserve API quota
 SUBJECTIVE_PATTERNS = {
     "team player": "Replace with a measurable proxy such as cross-functional stakeholder work.",
