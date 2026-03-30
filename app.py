@@ -15,6 +15,10 @@ from ats_poc.prompts import (
     CALL_2_TEMPLATE,
     CALL_3_SYSTEM,
     CALL_3_TEMPLATE,
+    CALL_PREVIEW_SYSTEM,
+    CALL_PREVIEW_TEMPLATE,
+    CALL_SYNTHESIZE_SYSTEM,
+    CALL_SYNTHESIZE_TEMPLATE,
     GENERIC_SYSTEM,
 )
 from ats_poc.resume_parser import extract_text_from_pdf, parse_resume_pdf
@@ -73,6 +77,20 @@ def init_session_state() -> None:
         "sample_results": None,
         "sandbox_raw_output": "",
         "sandbox_parsed_json": None,
+        # --- iterative preview loop ---
+        "preview_loop_state": "idle",
+        "base_criteria": None,
+        "synthesized_config": None,
+        "preview_resumes": [],
+        "preview_field_results": None,
+        "extra_params_history": [],
+        "current_include_input": "",
+        "current_exclude_input": "",
+        "preview_iteration_count": 0,
+        "preview_seen_files": set(),
+        "iteration_history": [],
+        "call_preview_template": CALL_PREVIEW_TEMPLATE,
+        "call_synthesize_template": CALL_SYNTHESIZE_TEMPLATE,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -166,6 +184,109 @@ def build_manual_edit_payload(original: dict[str, Any], edited: dict[str, Any], 
     }
 
 
+PREVIEW_BATCH_SIZE = 6
+
+
+def run_preview_call2_silent(criteria: dict[str, Any]) -> dict[str, Any]:
+    """Run Call 2 silently with no gap answers or manual edits."""
+    manual_payload = build_manual_edit_payload(criteria, criteria, "")
+    parsed_json, _raw, usage, _prompt = run_structured_call(
+        model_name=MODEL_NAME,
+        system_instruction=CALL_2_SYSTEM,
+        template=st.session_state.call_2_template,
+        replacements={
+            "CALL_1_JSON_OUTPUT": criteria,
+            "ROHAN_GAP_ANSWERS": {},
+            "ROHAN_EDITS": manual_payload,
+        },
+    )
+    add_usage("Preview Call 2", usage)
+    st.session_state.synthesized_config = parsed_json
+    return parsed_json
+
+
+def run_preview_scoring(criteria_config: dict[str, Any], resumes: list[dict[str, Any]]) -> dict[str, Any]:
+    """Run field-level scoring on 5-6 resumes using CALL_PREVIEW."""
+    resume_jsons = [item["resume_json"] for item in resumes]
+    parsed_json, _raw, usage, _prompt = run_structured_call(
+        model_name=MODEL_NAME,
+        system_instruction=CALL_PREVIEW_SYSTEM,
+        template=st.session_state.call_preview_template,
+        replacements={
+            "CRITERIA_JSON": criteria_config,
+            "RESUME_JSON_ARRAY": resume_jsons,
+        },
+    )
+    add_usage("Preview Score", usage)
+    st.session_state.preview_field_results = parsed_json
+    return parsed_json
+
+
+def run_synthesis() -> dict[str, Any]:
+    """Synthesize base criteria + all extra params into a new rubric."""
+    parsed_json, _raw, usage, _prompt = run_structured_call(
+        model_name=MODEL_NAME,
+        system_instruction=CALL_SYNTHESIZE_SYSTEM,
+        template=st.session_state.call_synthesize_template,
+        replacements={
+            "BASE_CRITERIA_JSON": st.session_state.base_criteria,
+            "EXTRA_PARAMS_HISTORY": st.session_state.extra_params_history,
+            "PREVIEW_RESULTS_JSON": st.session_state.preview_field_results or {},
+        },
+    )
+    add_usage("Synthesis", usage)
+    st.session_state.synthesized_config = parsed_json
+    return parsed_json
+
+
+def choose_preview_batch() -> None:
+    """Pick 5-6 unseen readable resumes for preview."""
+    config = st.session_state.synthesized_config or st.session_state.base_criteria
+    keywords = extract_keywords(st.session_state.jd_text, st.session_state.base_criteria, config)
+    readable = [r for r in st.session_state.resume_batch if r.get("quality", {}).get("readable")]
+
+    unseen = [r for r in readable if r["file_name"] not in st.session_state.preview_seen_files]
+    if not unseen:
+        st.session_state.preview_seen_files = set()
+        unseen = readable
+
+    if len(unseen) <= PREVIEW_BATCH_SIZE:
+        batch = unseen
+    else:
+        batch = pick_representative_sample(unseen, keywords, sample_size=PREVIEW_BATCH_SIZE)
+
+    for r in batch:
+        st.session_state.preview_seen_files.add(r["file_name"])
+    st.session_state.preview_resumes = batch
+
+
+def run_preview_iteration() -> None:
+    """Orchestrate one full preview iteration."""
+    st.session_state.iteration_history.append({
+        "iteration": st.session_state.preview_iteration_count,
+        "extra_params_snapshot": list(st.session_state.extra_params_history),
+        "results_snapshot": st.session_state.preview_field_results,
+    })
+
+    if st.session_state.extra_params_history:
+        run_synthesis()
+    elif st.session_state.synthesized_config is None:
+        run_preview_call2_silent(st.session_state.base_criteria)
+
+    choose_preview_batch()
+    run_preview_scoring(st.session_state.synthesized_config, st.session_state.preview_resumes)
+    st.session_state.preview_iteration_count += 1
+    st.session_state.preview_loop_state = "showing_results"
+
+
+def accept_and_run_full_eval() -> None:
+    """Accept preview criteria and transition to full evaluation."""
+    st.session_state.final_config = st.session_state.synthesized_config
+    st.session_state.edited_requirements = clone_requirements(st.session_state.base_criteria)
+    choose_resume_batch()
+    st.session_state.preview_loop_state = "done"
+
+
 def render_sidebar() -> None:
     st.sidebar.header("Configuration")
     st.sidebar.write(f"Model: `{MODEL_NAME}`")
@@ -198,6 +319,16 @@ def render_sidebar() -> None:
         st.session_state.call_3_template = st.text_area(
             "Call 3 Template",
             value=st.session_state.call_3_template,
+            height=260,
+        )
+        st.session_state.call_preview_template = st.text_area(
+            "Preview Scoring Template",
+            value=st.session_state.call_preview_template,
+            height=260,
+        )
+        st.session_state.call_synthesize_template = st.text_area(
+            "Synthesis Template",
+            value=st.session_state.call_synthesize_template,
             height=260,
         )
 
@@ -729,6 +860,241 @@ def render_sample_results() -> None:
         st.code(st.session_state.get("call_3_prompt", ""), language="text")
 
 
+def render_resume_upload_early() -> None:
+    """Upload and parse resumes right after Call 1, before the preview loop."""
+    if st.session_state.resume_batch:
+        st.success(
+            f"Resumes ready: {sum(1 for r in st.session_state.resume_batch if r.get('quality', {}).get('readable'))} "
+            f"readable of {len(st.session_state.resume_batch)} uploaded."
+        )
+        return
+
+    st.subheader("3. Upload Resumes")
+    st.info(
+        "Upload resumes now so the preview loop can score a sample batch "
+        "immediately against the extracted criteria."
+    )
+
+    jd = st.session_state.jd_analysis or {}
+    baseline = jd.get("baseline", {})
+    col1, col2 = st.columns(2)
+    with col1:
+        skills = baseline.get("skills_required", [])
+        if skills:
+            st.markdown("**Baseline skills being checked:**")
+            for s in skills:
+                st.markdown(f"- {s}")
+    with col2:
+        p0 = jd.get("p0_signals", [])
+        if p0:
+            st.markdown("**P0 ranking signals:**")
+            for p in p0:
+                st.markdown(f"- {p.get('signal', '')}")
+
+    uploaded = st.file_uploader(
+        "Upload resume PDFs",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="early_resume_uploader",
+    )
+    if st.button("Parse Resumes", use_container_width=True, key="early_parse_btn"):
+        if not uploaded:
+            st.error("Upload at least one resume PDF.")
+            return
+        parse_uploaded_resumes(uploaded)
+        st.session_state.base_criteria = clone_requirements(st.session_state.jd_analysis)
+        if st.session_state.resume_batch:
+            st.session_state.preview_loop_state = "ready"
+        st.rerun()
+
+
+def render_field_match_table() -> None:
+    """Show per-candidate field-level match breakdown for the current preview batch."""
+    results = st.session_state.preview_field_results
+    if not results:
+        return
+
+    summary = results.get("summary", {})
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Evaluated", summary.get("total_evaluated", 0))
+    c2.metric("P0", summary.get("p0_count", 0))
+    c3.metric("Baseline", summary.get("baseline_count", 0))
+    c4.metric("Reject", summary.get("reject_count", 0))
+
+    render_persisted_usage("Preview Score")
+
+    for candidate in results.get("results", []):
+        name = candidate.get("candidate_name", "Unknown")
+        cls = candidate.get("classification", "—")
+        score = candidate.get("overall_score", 0)
+        label = f"{name}  —  {cls}  —  {score}/100"
+        with st.expander(label, expanded=False):
+            field_rows = []
+            for fm in candidate.get("field_matches", []):
+                match_icon = {"pass": "✅", "fail": "❌", "partial": "⚠️"}.get(fm.get("match", ""), "—")
+                field_rows.append({
+                    "Field": fm.get("field", ""),
+                    "Resume Value": str(fm.get("value_from_resume", ""))[:120],
+                    "Criteria Checked": str(fm.get("criteria_checked", ""))[:120],
+                    "Match": f"{match_icon} {fm.get('match', '')}",
+                    "Note": fm.get("note", ""),
+                })
+            if field_rows:
+                st.dataframe(field_rows, use_container_width=True)
+
+            if candidate.get("baseline_failures"):
+                st.error("Baseline failures: " + ", ".join(candidate["baseline_failures"]))
+            if candidate.get("p0_matches"):
+                st.success("P0 matches: " + ", ".join(candidate["p0_matches"]))
+            if candidate.get("extra_param_matches"):
+                st.info("Extra param matches: " + ", ".join(candidate["extra_param_matches"]))
+            st.caption(candidate.get("reasoning", ""))
+
+
+def render_extra_params_input() -> None:
+    """Render the include/exclude input and action buttons."""
+    st.markdown("---")
+    st.markdown("**Refine the criteria for the next batch:**")
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        include_val = st.text_area(
+            "Also include candidates who...",
+            value=st.session_state.current_include_input,
+            height=100,
+            placeholder="e.g. 2+ years B2B SaaS, experience with enterprise clients",
+            key="include_text_area",
+        )
+        st.session_state.current_include_input = include_val
+    with col_b:
+        exclude_val = st.text_area(
+            "Exclude candidates who...",
+            value=st.session_state.current_exclude_input,
+            height=100,
+            placeholder="e.g. only consulting background, no product experience",
+            key="exclude_text_area",
+        )
+        st.session_state.current_exclude_input = exclude_val
+
+    history = st.session_state.extra_params_history
+    if history:
+        with st.expander(f"Parameters added so far ({len(history)} iteration(s))", expanded=False):
+            for entry in history:
+                st.markdown(f"**Iteration {entry['iteration'] + 1}**")
+                if entry.get("include"):
+                    st.markdown(f"- Include: {entry['include']}")
+                if entry.get("exclude"):
+                    st.markdown(f"- Exclude: {entry['exclude']}")
+
+    btn_col1, btn_col2 = st.columns(2)
+    with btn_col1:
+        if st.button("Re-evaluate with updated parameters", use_container_width=True, type="primary"):
+            include = st.session_state.current_include_input.strip()
+            exclude = st.session_state.current_exclude_input.strip()
+            if include or exclude:
+                st.session_state.extra_params_history.append({
+                    "iteration": st.session_state.preview_iteration_count,
+                    "include": include,
+                    "exclude": exclude,
+                })
+            st.session_state.current_include_input = ""
+            st.session_state.current_exclude_input = ""
+            st.session_state.preview_loop_state = "running"
+            try:
+                with st.status("Running preview iteration...", expanded=True) as status:
+                    configure_genai(api_key=resolve_api_key())
+                    run_preview_iteration()
+                    status.update(label="Preview complete", state="complete")
+            except Exception as exc:
+                st.session_state.preview_loop_state = "showing_results"
+                st.exception(exc)
+            st.rerun()
+    with btn_col2:
+        if st.button("Accept & Run Full Evaluation", use_container_width=True):
+            accept_and_run_full_eval()
+            st.rerun()
+
+
+def render_iteration_history() -> None:
+    """Show the history of preview iterations."""
+    history = st.session_state.iteration_history
+    if not history:
+        return
+    with st.expander("Iteration History", expanded=False):
+        for entry in history:
+            i = entry["iteration"]
+            st.markdown(f"**Iteration {i + 1}**")
+            params = entry.get("extra_params_snapshot", [])
+            active = [p for p in params if p["iteration"] == i]
+            if active:
+                for p in active:
+                    if p.get("include"):
+                        st.markdown(f"- Include: {p['include']}")
+                    if p.get("exclude"):
+                        st.markdown(f"- Exclude: {p['exclude']}")
+            snapshot = entry.get("results_snapshot")
+            if snapshot and snapshot.get("summary"):
+                s = snapshot["summary"]
+                st.caption(
+                    f"Results: {s.get('p0_count', 0)} P0 / "
+                    f"{s.get('baseline_count', 0)} Baseline / "
+                    f"{s.get('reject_count', 0)} Reject"
+                )
+            st.divider()
+
+
+def render_preview_loop() -> None:
+    """Main dispatcher for the iterative preview loop."""
+    if not st.session_state.jd_analysis or not st.session_state.resume_batch:
+        return
+
+    st.subheader("4. Iterative Preview Loop")
+    state = st.session_state.preview_loop_state
+
+    if state == "idle":
+        return
+
+    if state == "ready":
+        readable = sum(1 for r in st.session_state.resume_batch if r.get("quality", {}).get("readable"))
+        st.info(
+            f"**{readable} readable resumes** ready. The preview will score "
+            f"{min(readable, PREVIEW_BATCH_SIZE)} of them against the extracted "
+            "baseline and P0 criteria, showing a field-by-field breakdown. "
+            "You can then refine criteria iteratively before running the full evaluation."
+        )
+        if not api_key_available():
+            st.error("Add a Gemini API key in the sidebar before starting the preview.")
+            return
+        if st.button("Start Preview", use_container_width=True, type="primary"):
+            st.session_state.preview_loop_state = "running"
+            try:
+                with st.status("Running first preview batch...", expanded=True) as status:
+                    configure_genai(api_key=resolve_api_key())
+                    run_preview_iteration()
+                    status.update(label="Preview complete", state="complete")
+            except Exception as exc:
+                st.session_state.preview_loop_state = "ready"
+                st.exception(exc)
+            st.rerun()
+
+    elif state == "showing_results":
+        st.markdown(f"**Preview — Iteration {st.session_state.preview_iteration_count}**")
+        if st.session_state.synthesized_config:
+            st.caption(
+                st.session_state.synthesized_config.get("screening_summary", "")
+            )
+        render_field_match_table()
+        render_extra_params_input()
+
+    elif state == "done":
+        st.success("Preview loop complete — criteria locked in.")
+        config = st.session_state.synthesized_config or {}
+        notes = config.get("synthesis_notes", "")
+        if notes:
+            st.info(f"Synthesis summary: {notes}")
+        render_iteration_history()
+
+
 def render_prompt_sandbox() -> None:
     st.subheader("Prompt Sandbox")
     st.caption("Use this to test prompt variants and inspect raw model JSON plus token usage.")
@@ -771,10 +1137,21 @@ def main() -> None:
         render_run_overview()
         render_jd_input()
         render_quality_check()
+
+        # Early resume upload + iterative preview loop
+        if st.session_state.jd_analysis:
+            render_resume_upload_early()
+        if st.session_state.jd_analysis and st.session_state.resume_batch:
+            render_preview_loop()
+
+        # Optional deep-edit path (gap questions + manual criteria editor)
         render_plain_english_editor()
         render_gap_questions()
-        render_resume_upload()
-        render_sample_results()
+
+        # Full evaluation (shown after preview loop accepts, or via manual Call 2 path)
+        if st.session_state.final_config:
+            render_resume_upload()
+            render_sample_results()
 
     with sandbox_tab:
         render_prompt_sandbox()

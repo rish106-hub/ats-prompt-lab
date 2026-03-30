@@ -175,3 +175,133 @@ Rules:
 """.strip()
 
 GENERIC_SYSTEM = "You are a precise prompt testing assistant. Follow the user's instruction exactly."
+
+CALL_PREVIEW_SYSTEM = (
+    "You are a resume screening assistant performing field-level analysis. "
+    "For each resume, check every relevant field against the provided criteria. "
+    "Be specific about which criteria each field satisfies or fails. "
+    "Return ONLY valid JSON. No markdown. No preamble."
+)
+
+CALL_PREVIEW_TEMPLATE = """
+SCREENING CRITERIA (baseline + P0 signals + extra parameters):
+{{CRITERIA_JSON}}
+
+RESUMES (full JSON, 5-6 candidates):
+{{RESUME_JSON_ARRAY}}
+
+For each resume, return a detailed field-level analysis. Return this exact JSON:
+
+{
+  "results": [
+    {
+      "candidate_name": "",
+      "field_matches": [
+        {
+          "field": "",
+          "value_from_resume": "",
+          "criteria_checked": "",
+          "match": "pass|fail|partial",
+          "note": ""
+        }
+      ],
+      "baseline_pass": true,
+      "baseline_failures": [],
+      "p0_score": 0,
+      "p0_matches": [],
+      "extra_param_matches": [],
+      "overall_score": 0,
+      "classification": "P0|Baseline|Reject",
+      "reasoning": ""
+    }
+  ],
+  "summary": {
+    "total_evaluated": 0,
+    "p0_count": 0,
+    "baseline_count": 0,
+    "reject_count": 0
+  }
+}
+
+Rules:
+1. field_matches: include one entry per resume field that was checked.
+   Use the actual field names from the resume JSON: name, education,
+   work_experience, skills, certifications, projects, total_experience_years.
+2. criteria_checked: quote the specific criterion from SCREENING CRITERIA
+   that was applied to this field.
+3. match values:
+   - "pass" = field clearly satisfies the criterion
+   - "fail" = field clearly fails the criterion
+   - "partial" = field partially satisfies (e.g. related but not exact skill)
+4. extra_param_matches: list which extra parameters (if any) this candidate satisfies.
+5. baseline_pass false = automatic Reject regardless of p0_score.
+6. overall_score: 0 to 100. baseline_pass false candidates score below 30.
+7. reasoning: 2-3 sentences. Reference specific field values, not generalities.
+8. Rank results array by overall_score descending.
+""".strip()
+
+CALL_SYNTHESIZE_SYSTEM = (
+    "You are a hiring criteria synthesis engine. You take a base set of hiring "
+    "criteria and a history of recruiter-added include/exclude parameters, and "
+    "synthesize them into a single unified evaluation rubric. Preserve all base "
+    "criteria. Layer in recruiter preferences as tighter or looser filters and "
+    "updated P0 signals. Return ONLY valid JSON. No markdown. No preamble."
+)
+
+CALL_SYNTHESIZE_TEMPLATE = """
+BASE CRITERIA (from JD analysis — do not remove any of these):
+{{BASE_CRITERIA_JSON}}
+
+RECRUITER EXTRA PARAMETERS (accumulated across all iterations):
+{{EXTRA_PARAMS_HISTORY}}
+
+LAST PREVIEW RESULTS (for context — shows what the current criteria produced):
+{{PREVIEW_RESULTS_JSON}}
+
+Synthesize all of the above into a single unified rubric. Return this exact JSON:
+
+{
+  "final_evaluation_prompt": "",
+  "required_resume_fields": [],
+  "scoring_rubric": {
+    "baseline_checks": [
+      {
+        "check": "",
+        "resume_field": "",
+        "reject_if_missing": true
+      }
+    ],
+    "p0_weights": [
+      {
+        "signal": "",
+        "weight": 0,
+        "resume_field": ""
+      }
+    ],
+    "red_flag_checks": [
+      {
+        "check": "",
+        "resume_field": "",
+        "deprioritize_if_present": true
+      }
+    ]
+  },
+  "screening_summary": "",
+  "synthesis_notes": ""
+}
+
+Rules:
+1. final_evaluation_prompt: comprehensive LLM instruction combining ALL
+   base criteria AND all recruiter extra parameters.
+2. required_resume_fields: ONLY fields actually needed from: name, education,
+   work_experience, skills, certifications, projects, publications, github_url,
+   total_experience_years, career_gaps_months.
+3. p0_weights must sum to 100.
+4. Each "include" extra parameter should become either a new baseline_check
+   or an increase in p0_weight for a relevant signal.
+5. Each "exclude" extra parameter should become a new red_flag_check or a
+   tighter baseline_check.
+6. screening_summary: 2 sentences plain English for a non-technical recruiter.
+7. synthesis_notes: 2-3 sentences explaining what changed from the base
+   criteria and why (based on the recruiter parameters added).
+""".strip()
